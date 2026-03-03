@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shona Capital - Bank Analyzer</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body style="margin:0;padding:0">
+  <div id="root"></div>
+  <script type="text/babel">
+
+// ─── Theme ───────────────────────────────────────────────────────────────────
+const C = {
+  primary:     "#2563eb",
+  primaryLight:"#3b82f6",
+  primaryPale: "#60a5fa",
+  primaryGlow: "#2563eb18",
+  primaryBorder:"#2563eb30",
+  bg:          "#060d1a",
+  bgCard:      "#0d1b2e",
+  bgAlt:       "#09121e",
+  border:      "#1e3a5f",
+  borderLight: "#162d4a",
+  text:        "#f1f5f9",
+  textMid:     "#94a3b8",
+  textDim:     "#475569",
+  textFaint:   "#1e3a5f",
+  green:       "#10b981",
+  red:         "#ef4444",
+  amber:       "#f59e0b",
+  cyan:        "#22d3ee",
+  purple:      "#8b5cf6",
+};
+
+const GRAD = `linear-gradient(135deg, ${C.primaryLight}, ${C.primary})`;
+
+// ─── Banks ────────────────────────────────────────────────────────────────────
+const UGANDAN_BANKS = [
+  { id: "absa",        name: "Absa Bank Uganda",      color: "#BE1E2D" },
+  { id: "stanbic",     name: "Stanbic Bank Uganda",   color: "#0033A0" },
+  { id: "centenary",   name: "Centenary Bank",        color: "#006633" },
+  { id: "dfcu",        name: "DFCU Bank",             color: "#E30613" },
+  { id: "equity",      name: "Equity Bank Uganda",    color: "#EE1C25" },
+  { id: "kcb",         name: "KCB Uganda",            color: "#006747" },
+  { id: "dtb",         name: "DTB Uganda",            color: "#004A97" },
+  { id: "postbank",    name: "Post Bank Uganda",      color: "#FDB913" },
+  { id: "financetrst", name: "Finance Trust Bank",    color: "#8B1A1A" },
+  { id: "housingfin",  name: "Housing Finance Bank",  color: "#1B3A6B" },
+  { id: "other",       name: "Other / Unknown",       color: "#475569" },
+];
+
+const CHANNEL_SOURCES = new Set([
+  "Merchant Sales (POS)", "Airtel Mobile Commerce",
+  "VISA Card Settlement", "MTN Mobile Money", "PesaPal Uganda Ltd",
+]);
+
+// ─── AI Parser ────────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are a bank statement extraction engine specialised in Ugandan banks (Absa, Stanbic, Centenary, DFCU, Equity, KCB, DTB, Post Bank, Finance Trust, Housing Finance).
+
+Extract ALL transactions and account metadata. Return ONLY valid JSON — no markdown, no preamble.
+
+JSON schema:
+{
+  "accountHolder":"string","accountNumber":"string","bankName":"string",
+  "periodFrom":"DD/MM/YYYY","periodTo":"DD/MM/YYYY","currency":"UGX",
+  "openingBalance":number_or_null,"closingBalance":number_or_null,
+  "transactions":[
+    {"date":"DD/MM/YYYY","particulars":"full narration","debit":number_or_null,"credit":number_or_null,"balance":number_or_null}
+  ]
+}
+
+Rules: strip commas from numbers; Withdrawals/DR/Debit columns → debit; Deposits/CR/Credit → credit; negative amounts → positive debit; skip header/summary rows; return ONLY the JSON.`;
+
+async function parseWithAI(text, bankName) {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514", max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: `Bank: ${bankName}\n\n${text.slice(0, 18000)}` }],
+    }),
+  });
+  if (!resp.ok) throw new Error(`API ${resp.status}`);
+  const data = await resp.json();
+  const raw = data.content?.find(b => b.type === "text")?.text || "{}";
+  return JSON.parse(raw.replace(/```json|```/g, "").trim());
+}
+
+// ─── Metrics ──────────────────────────────────────────────────────────────────
+function parseDate(s) {
+  if (!s) return null;
+  const p = s.split(/[\/\-]/);
+  if (p.length < 3) return null;
+  const dt = new Date(+p[2], +p[1] - 1, +p[0]);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+function classifySource(p = "") {
+  const u = p.toUpperCase();
+  if (/MERCHANT PYTS|MERCHANT PAYMENTS|MERC/.test(u))                 return "Merchant Sales (POS)";
+  if (/AIRTEL MOBILE|AIRTEL MOMO/.test(u))                             return "Airtel Mobile Commerce";
+  if (/VISA CARD|VISA SETTLEMENT/.test(u))                             return "VISA Card Settlement";
+  if (/MTN MOBILE|MTN MOMO|MTN WALLET/.test(u))                        return "MTN Mobile Money";
+  if (/PESAPAL/.test(u))                                               return "PesaPal Uganda Ltd";
+  if (/NSSF/.test(u))                                                  return "NSSF";
+  if (/\bURA\b/.test(u))                                               return "URA";
+  if (/WAGES|SALARY|SALARIES/.test(u))                                 return "Wages / Salaries";
+  if (/LOAN PAYMENT|LOAN SETTLEMENT/.test(u))                          return "Loan Repayment";
+  if (/EXCISE|EFT FEE|ACCOUNT MAINT|BRANCH INT|SBICP|KCBUP/.test(u))  return "Bank Charges & Fees";
+  if (/IB\|XX|IB TRANSFER|IB\|MB/.test(u))                            return "IB Transfer (Outward)";
+  if (/GENERATOR/.test(u))                                             return "Generator Expense";
+  if (/UTILITY|UMEME|KAMPALA\/[0-9]/.test(u))                          return "Utility / UMEME";
+  return "Others / Cash Transfers";
+}
+
+function calcMetrics(txns, relatedParties) {
+  if (!txns.length) return null;
+  const dated = txns.map(t => ({ ...t, dateObj: parseDate(t.date) })).filter(t => t.dateObj);
+  if (!dated.length) return null;
+  dated.sort((a, b) => a.dateObj - b.dateObj);
+
+  const minDate = dated[0].dateObj;
+  const maxDate = dated[dated.length - 1].dateObj;
+
+  // EOD balances (forward-fill)
+  const balMap = {};
+  for (const t of dated) if (t.balance != null) balMap[t.dateObj.toISOString().slice(0,10)] = t.balance;
+  const days = [];
+  const cur = new Date(minDate);
+  while (cur <= maxDate) { days.push(cur.toISOString().slice(0,10)); cur.setDate(cur.getDate()+1); }
+  let lb = dated[0].balance ?? 0;
+  const dailyBals = days.map(d => { if (balMap[d] != null) lb = balMap[d]; return lb; });
+  const A = dailyBals.reduce((s,b) => s+b, 0) / dailyBals.length;
+
+  // Monthly aggregation
+  const mcMap = {}, mdMap = {};
+  for (const t of dated) {
+    const k = `${t.dateObj.getFullYear()}-${String(t.dateObj.getMonth()+1).padStart(2,"0")}`;
+    if (t.credit) mcMap[k] = (mcMap[k]||0) + t.credit;
+    if (t.debit)  mdMap[k] = (mdMap[k]||0) + t.debit;
+  }
+  const mKeys   = Object.keys(mcMap).sort();
+  const mC      = mKeys.map(k => mcMap[k]||0);
+  const mD      = mKeys.map(k => mdMap[k]||0);
+  const meanC   = mC.reduce((s,v)=>s+v,0) / (mC.length||1);
+  const VLI     = 0.2 * meanC;
+  const stdC    = Math.sqrt(mC.reduce((s,v)=>s+(v-meanC)**2,0) / (mC.length||1));
+  const CV      = meanC > 0 ? (stdC/meanC)*100 : 0;
+
+  // CCR
+  const totalC = txns.filter(t=>t.credit).reduce((s,t)=>s+t.credit,0);
+  const srcMap = {};
+  for (const t of txns) { if (!t.credit) continue; const s = classifySource(t.particulars); srcMap[s]=(srcMap[s]||0)+t.credit; }
+
+  const relLow = relatedParties.map(r => r.toLowerCase());
+  const eligible = Object.entries(srcMap)
+    .filter(([s]) => !CHANNEL_SOURCES.has(s) && !relLow.some(r => s.toLowerCase().includes(r)))
+    .sort((a,b) => b[1]-a[1]);
+  const top3      = eligible.slice(0,3);
+  const top3Total = top3.reduce((s,[,v])=>s+v,0);
+  const CCR       = totalC > 0 ? (top3Total/totalC)*100 : 0;
+
+  const mLabels = mKeys.map(k => { const [y,mo]=k.split("-"); return new Date(+y,+mo-1,1).toLocaleDateString("en-GB",{month:"short",year:"numeric"}); });
+
+  return { A, VLI, CV, CCR, stdC, meanC, totalCredits:totalC, top3, top3Total, eligible, srcMap, mLabels, mC, mD, mKeys, days:days.length, minDate, maxDate, relatedParties };
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const fmt    = n => n == null ? "—" : Math.round(n).toLocaleString("en-UG");
+const fmtPct = n => n == null ? "—" : n.toFixed(2)+"%";
+
+function cvInfo(cv) {
+  if (cv < 10) return { label:"EXTREMELY LOW", color:C.green };
+  if (cv < 20) return { label:"LOW",            color:C.cyan  };
+  if (cv < 50) return { label:"MODERATE",       color:C.amber };
+  return             { label:"HIGH VOLATILITY", color:C.red   };
+}
+function ccrInfo(ccr) {
+  if (ccr < 10) return { label:"VERY DISPERSED",  color:C.green };
+  if (ccr < 30) return { label:"LOW CONC.",         color:C.cyan  };
+  if (ccr < 60) return { label:"MODERATE CONC.",   color:C.amber };
+  return              { label:"HIGH CONC.",         color:C.red   };
+}
+
+// ─── UI ───────────────────────────────────────────────────────────────────────
+function MetricCard({ label, value, sub, color, bdg, interp }) {
+  return (
+    <div style={{ background:C.bgCard, border:`1px solid ${color}28`, borderRadius:14, padding:"22px 24px", position:"relative", overflow:"hidden" }}>
+      <div style={{ position:"absolute", inset:0, background:`radial-gradient(circle at 90% 10%,${color}14,transparent 65%)`, pointerEvents:"none" }}/>
+      <div style={{ position:"absolute", bottom:0, left:0, right:0, height:2, background:`linear-gradient(90deg,${color}00,${color}55,${color}00)` }}/>
+      {bdg && <span style={{ position:"absolute", top:13, right:13, background:bdg.color+"1e", color:bdg.color, border:`1px solid ${bdg.color}40`, padding:"2px 9px", borderRadius:20, fontSize:9.5, fontWeight:700, letterSpacing:1, fontFamily:"monospace" }}>{bdg.label}</span>}
+      <div style={{ fontSize:9.5, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:2, textTransform:"uppercase", marginBottom:9 }}>{label}</div>
+      <div style={{ fontSize:26, fontWeight:800, color:C.text, letterSpacing:-1, lineHeight:1, marginBottom:3 }}>{value}</div>
+      {sub && <div style={{ fontSize:10.5, color:C.textDim, marginTop:2 }}>{sub}</div>}
+      {interp && <div style={{ marginTop:13, padding:"9px 11px", background:color+"0d", borderLeft:`3px solid ${color}`, borderRadius:"0 6px 6px 0", fontSize:11, color:C.textMid, lineHeight:1.65 }}>{interp}</div>}
+    </div>
+  );
+}
+
+function DTable({ headers, rows, rowBg }) {
+  return (
+    <div style={{ overflowX:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12.5 }}>
+        <thead>
+          <tr>{headers.map((h,i) => <th key={i} style={{ padding:"9px 14px", textAlign:i===0?"left":"right", color:C.textDim, fontFamily:"'DM Mono',monospace", fontSize:9.5, letterSpacing:1.5, textTransform:"uppercase", borderBottom:`1px solid ${C.border}`, fontWeight:600, whiteSpace:"nowrap" }}>{h}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((row,i) => (
+            <tr key={i} style={{ background:rowBg?.(row,i)??(i%2===0?C.bgAlt:C.bgCard) }}>
+              {row.map((cell,j) => <td key={j} style={{ padding:"8px 14px", textAlign:j===0?"left":"right", color:j===0?C.textMid:C.textDim, borderBottom:`1px solid ${C.border}0a`, fontFamily:j===0?"inherit":"'DM Mono',monospace" }}>{cell}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SHead({ title }) {
+  return (
+    <div style={{ display:"flex", alignItems:"center", gap:11, marginBottom:16 }}>
+      <div style={{ width:3, height:18, background:GRAD, borderRadius:2 }}/>
+      <h2 style={{ margin:0, fontSize:13.5, fontWeight:700, color:C.text }}>{title}</h2>
+    </div>
+  );
+}
+
+function Bar({ pct, color }) {
+  return <div style={{ height:5, background:C.border, borderRadius:3, overflow:"hidden", flex:1 }}><div style={{ height:"100%", width:`${Math.min(pct,100)}%`, background:color, borderRadius:3 }}/></div>;
+}
+
+// ─── CSS ──────────────────────────────────────────────────────────────────────
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; }
+  .dz { transition: all .2s; }
+  .dz:hover, .dz.drag { border-color: #3b82f6 !important; background: #060e1f !important; }
+  .btn { font-family:'Sora',sans-serif; cursor:pointer; border:none; transition:all .15s; }
+  .bprimary { background:${GRAD}; color:#fff; padding:13px 28px; border-radius:10px; font-size:14px; font-weight:700; letter-spacing:.3px; }
+  .bprimary:hover { opacity:.9; transform:translateY(-1px); box-shadow:0 8px 24px #2563eb40; }
+  .bprimary:disabled { opacity:.35; cursor:not-allowed; transform:none; box-shadow:none; }
+  .bsm { background:${C.border}; color:#7dd3fc; padding:8px 16px; border-radius:8px; font-size:12px; font-weight:600; }
+  .bsm:hover { background:#284f7a; }
+  .bnk { border-radius:10px; padding:9px 12px; font-size:11.5px; font-weight:600; font-family:'Sora',sans-serif; cursor:pointer; transition:all .15s; text-align:left; }
+  .tag { display:inline-flex; align-items:center; gap:5px; background:${C.border}; border:1px solid #2d5f8a; color:#7dd3fc; padding:3px 10px; border-radius:20px; font-size:12px; }
+  .tag button { background:none; border:none; color:${C.red}; cursor:pointer; font-size:13px; line-height:1; padding:0; }
+  .ttab { padding:9px 18px; border:none; background:none; cursor:pointer; font-family:'Sora',sans-serif; font-size:13px; font-weight:600; color:${C.textDim}; border-bottom:2px solid transparent; transition:all .15s; }
+  .ttab.on { color:${C.primaryLight}; border-bottom-color:${C.primaryLight}; }
+  .ttab:hover:not(.on) { color:${C.textMid}; }
+  tr:hover td { background:#0d2040 !important; }
+  input:focus { outline:none; }
+`;
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [stage,    setStage]    = useState("upload");
+  const [dragging, setDragging] = useState(false);
+  const [files,    setFiles]    = useState([]);
+  const [bankId,   setBankId]   = useState("absa");
+  const [relInput, setRelInput] = useState("");
+  const [related,  setRelated]  = useState([]);
+  const [results,  setResults]  = useState(null);
+  const [busy,     setBusy]     = useState(false);
+  const [log,      setLog]      = useState([]);
+  const [err,      setErr]      = useState("");
+  const [tab,      setTab]      = useState("overview");
+  const [search,   setSearch]   = useState("");
+  const fileRef = useRef();
+
+  const addLog = m => setLog(p => [...p, m]);
+  const addRel = () => { const t=relInput.trim(); if(t&&!related.includes(t)) setRelated(p=>[...p,t]); setRelInput(""); };
+  const onDrop = useCallback(e => { e.preventDefault(); setDragging(false); setFiles(p=>[...p,...Array.from(e.dataTransfer.files).filter(f=>/\.(pdf|txt|csv)$/i.test(f.name))]); }, []);
+
+  const analyze = async () => {
+    if (!files.length) return;
+    setBusy(true); setErr(""); setLog([]);
+    try {
+      const bank = UGANDAN_BANKS.find(b=>b.id===bankId)||UGANDAN_BANKS[0];
+      addLog(`Reading ${files.length} file(s)…`);
+      const texts = await Promise.all(files.map(f=>f.text().catch(()=>"")));
+      addLog(`Sending to Claude AI (${bank.name})…`);
+      const parsed = await parseWithAI(texts.join("\n\n---NEXT FILE---\n\n"), bank.name);
+      const txns = parsed.transactions||[];
+      addLog(`Extracted ${txns.length} transactions.`);
+      if (!txns.length) throw new Error("No transactions found. Try exporting as text/CSV.");
+      addLog("Computing A, VLI, CV, CCR…");
+      const metrics = calcMetrics(txns, related);
+      setResults({ accountHolder:parsed.accountHolder||"", accountNumber:parsed.accountNumber||"", bankName:parsed.bankName||bank.name, periodFrom:parsed.periodFrom||"", periodTo:parsed.periodTo||"", currency:parsed.currency||"UGX", openingBalance:parsed.openingBalance??null, closingBalance:parsed.closingBalance??null, txns, metrics });
+      addLog("Done ✓");
+      setStage("results"); setTab("overview");
+    } catch(e) { setErr(e.message||"Unknown error"); }
+    finally { setBusy(false); }
+  };
+
+  const reset = () => { setStage("upload"); setFiles([]); setResults(null); setRelated([]); setLog([]); setErr(""); };
+
+  const BASE = { background:C.bg, color:C.text, fontFamily:"'Sora',sans-serif", minHeight:"100vh" };
+  const CARD = { background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:13 };
+
+  // ── Upload / Config ────────────────────────────────────────────────────────
+  if (stage !== "results") return (
+    <div style={BASE}><style>{CSS}</style>
+
+      {/* Nav */}
+      <div style={{ borderBottom:`1px solid ${C.border}`, padding:"0 36px" }}>
+        <div style={{ maxWidth:820, margin:"0 auto", height:56, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{ width:30, height:30, background:GRAD, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:15 }}>📊</div>
+            <span style={{ fontWeight:800, fontSize:14.5, letterSpacing:-0.4 }}>StatementIQ</span>
+          </div>
+          <div style={{ display:"flex", gap:22 }}>
+            {[["upload","Upload"],["config","Configure"],["results","Results"]].map(([s,l]) => (
+              <div key={s} style={{ display:"flex", alignItems:"center", gap:6, fontSize:12, color:stage===s?C.primaryLight:C.textDim }}>
+                <div style={{ width:5, height:5, borderRadius:"50%", background:"currentColor" }}/>{l}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth:680, margin:"0 auto", padding:"52px 22px" }}>
+
+        {/* ── UPLOAD ── */}
+        {stage==="upload" && <>
+          <div style={{ textAlign:"center", marginBottom:44 }}>
+            <h1 style={{ fontSize:38, fontWeight:800, letterSpacing:-2, margin:0, lineHeight:1.1 }}>
+              Bank Statement<br/>
+              <span style={{ background:`linear-gradient(90deg,${C.primaryPale},${C.primary})`, WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>Analysis Engine</span>
+            </h1>
+            <p style={{ color:C.textDim, marginTop:13, fontSize:13.5, lineHeight:1.75 }}>
+              AI-powered · All major Ugandan banks · A, VLI, CV &amp; CCR metrics
+            </p>
+          </div>
+
+          <div className={`dz ${dragging?"drag":""}`} onClick={()=>fileRef.current?.click()}
+            onDragOver={e=>{e.preventDefault();setDragging(true);}} onDragLeave={()=>setDragging(false)} onDrop={onDrop}
+            style={{ border:`2px dashed ${C.border}`, borderRadius:16, padding:"48px 36px", textAlign:"center", cursor:"pointer", marginBottom:18 }}>
+            <input ref={fileRef} type="file" accept=".pdf,.txt,.csv" multiple style={{ display:"none" }} onChange={e=>setFiles(p=>[...p,...Array.from(e.target.files)])}/>
+            <div style={{ fontSize:34, marginBottom:10 }}>📄</div>
+            <div style={{ fontWeight:700, fontSize:15, marginBottom:5 }}>Drop statement files here</div>
+            <div style={{ fontSize:12, color:C.textDim }}>PDF · TXT · CSV &nbsp;·&nbsp; Multiple files supported</div>
+          </div>
+
+          {files.length>0 && (
+            <div style={{ ...CARD, padding:"14px 18px", marginBottom:18 }}>
+              <div style={{ fontSize:9.5, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:10 }}>{files.length} file{files.length>1?"s":""} queued</div>
+              {files.map((f,i) => (
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"5px 0", borderBottom:i<files.length-1?`1px solid ${C.border}`:"none" }}>
+                  <span style={{ fontSize:12.5, color:C.textMid }}>📄 {f.name}</span>
+                  <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+                    <span style={{ fontSize:11, color:C.textFaint, fontFamily:"'DM Mono',monospace" }}>{(f.size/1024).toFixed(0)} KB</span>
+                    <button className="btn" onClick={e=>{e.stopPropagation();setFiles(files.filter((_,j)=>j!==i));}} style={{ background:"none", color:C.red+"66", fontSize:14, padding:0 }}>✕</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Bank picker */}
+          <div style={{ ...CARD, padding:"18px 22px", marginBottom:26 }}>
+            <div style={{ fontSize:9.5, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:12 }}>Select Bank</div>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(185px,1fr))", gap:7 }}>
+              {UGANDAN_BANKS.map(b => (
+                <button key={b.id} className="bnk" onClick={()=>setBankId(b.id)}
+                  style={{ border:bankId===b.id?`2px solid ${b.color}`:`2px solid ${C.border}`, background:bankId===b.id?b.color+"18":C.bg, color:bankId===b.id?b.color:C.textDim }}>
+                  {b.name}{bankId===b.id&&<span style={{ float:"right" }}>✓</span>}
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize:10.5, color:C.textFaint, marginTop:10 }}>Helps Claude parse the statement format more accurately.</div>
+          </div>
+
+          <button className="btn bprimary" style={{ width:"100%" }} disabled={!files.length} onClick={()=>setStage("config")}>Continue →</button>
+        </>}
+
+        {/* ── CONFIG ── */}
+        {stage==="config" && <>
+          <button className="btn" onClick={()=>setStage("upload")} style={{ background:"none", color:C.textDim, padding:0, marginBottom:24, fontSize:13 }}>← Back</button>
+          <h2 style={{ fontSize:24, fontWeight:800, letterSpacing:-1, margin:"0 0 8px" }}>Configure CCR</h2>
+          <p style={{ color:C.textDim, fontSize:13, marginBottom:28, lineHeight:1.75 }}>
+            Name any related parties whose deposits should be excluded from CCR.<br/>
+            Payment channels (Merchant POS, Airtel, VISA, MTN, PesaPal) are always auto-excluded.
+          </p>
+
+          <div style={{ ...CARD, padding:"20px 22px", marginBottom:16 }}>
+            <div style={{ fontSize:9.5, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:12 }}>Related Parties — Excluded from CCR</div>
+            <div style={{ display:"flex", gap:9, marginBottom:12 }}>
+              <input value={relInput} onChange={e=>setRelInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addRel()}
+                placeholder="Type a name and press Enter or Add…"
+                style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:8, padding:"9px 13px", color:C.text, fontSize:13 }}/>
+              <button className="btn bsm" onClick={addRel}>Add</button>
+            </div>
+            {related.length>0
+              ? <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>{related.map(p=><span key={p} className="tag">{p}<button onClick={()=>setRelated(r=>r.filter(x=>x!==p))}>×</button></span>)}</div>
+              : <div style={{ fontSize:11.5, color:C.textFaint, fontStyle:"italic" }}>No related parties added.</div>}
+          </div>
+
+          <div style={{ ...CARD, padding:"14px 18px", marginBottom:26 }}>
+            <div style={{ fontSize:9.5, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:9 }}>Auto-Excluded Channels</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:7 }}>
+              {[...CHANNEL_SOURCES].map(c=><span key={c} style={{ background:C.bgAlt, color:C.textDim, padding:"3px 11px", borderRadius:20, fontSize:11.5, textDecoration:"line-through" }}>{c}</span>)}
+            </div>
+          </div>
+
+          {(busy||log.length>0) && (
+            <div style={{ ...CARD, padding:"14px 18px", marginBottom:16 }}>
+              <div style={{ fontSize:9.5, color:C.primaryLight, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:9 }}>Processing Log</div>
+              {log.map((l,i)=><div key={i} style={{ fontSize:11.5, color:C.textDim, fontFamily:"'DM Mono',monospace", lineHeight:2 }}><span style={{ color:C.primaryLight }}>▸ </span>{l}</div>)}
+              {busy&&<div style={{ fontSize:11.5, color:C.textDim, fontFamily:"'DM Mono',monospace", lineHeight:2 }}><span style={{ color:C.amber }}>⟳ </span>Working…</div>}
+            </div>
+          )}
+
+          {err&&<div style={{ background:"#1a0505", border:`1px solid ${C.red}`, borderRadius:9, padding:"12px 16px", color:"#fca5a5", fontSize:12.5, marginBottom:16 }}>⚠ {err}</div>}
+
+          <button className="btn bprimary" style={{ width:"100%" }} disabled={busy} onClick={analyze}>{busy?"Analysing…":"Run Analysis →"}</button>
+        </>}
+      </div>
+    </div>
+  );
+
+  // ── Results ────────────────────────────────────────────────────────────────
+  const { txns, metrics:m, accountHolder, accountNumber, bankName, periodFrom, periodTo, openingBalance, closingBalance } = results;
+  const totalC  = txns.filter(t=>t.credit).reduce((s,t)=>s+t.credit,0);
+  const totalD  = txns.filter(t=>t.debit ).reduce((s,t)=>s+t.debit, 0);
+  const cvI     = cvInfo(m?.CV??0);
+  const ccrI    = ccrInfo(m?.CCR??0);
+  const filtered = txns.filter(t=>!search||t.particulars?.toLowerCase().includes(search.toLowerCase())||t.date?.includes(search));
+
+  return (
+    <div style={{ background:C.bg, color:C.text, fontFamily:"'Sora',sans-serif", minHeight:"100vh" }}><style>{CSS}</style>
+
+      {/* Topbar */}
+      <div style={{ borderBottom:`1px solid ${C.border}`, padding:"0 28px", position:"sticky", top:0, background:C.bg, zIndex:100 }}>
+        <div style={{ maxWidth:1120, margin:"0 auto", height:54, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{ width:26, height:26, background:GRAD, borderRadius:7, display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>📊</div>
+            <span style={{ fontWeight:800, fontSize:14 }}>StatementIQ</span>
+            <span style={{ color:C.border }}>|</span>
+            <span style={{ fontSize:12, color:C.textDim }}>{accountHolder||bankName}</span>
+          </div>
+          <button onClick={reset} style={{ background:"none", border:`1px solid ${C.border}`, color:C.textDim, padding:"5px 13px", borderRadius:7, cursor:"pointer", fontSize:11.5, fontFamily:"'Sora',sans-serif" }}>＋ New Analysis</button>
+        </div>
+      </div>
+
+      <div style={{ maxWidth:1120, margin:"0 auto", padding:"26px 22px" }}>
+
+        {/* Account strip */}
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(155px,1fr))", gap:9, marginBottom:26 }}>
+          {[["Bank",bankName||"—"],["Account",accountNumber||"—"],["Period",periodFrom&&periodTo?`${periodFrom} – ${periodTo}`:"—"],["Opening Bal.",openingBalance!=null?`UGX ${fmt(openingBalance)}`:"—"],["Closing Bal.",closingBalance!=null?`UGX ${fmt(closingBalance)}`:"—"],["Transactions",txns.length.toString()]].map(([l,v])=>(
+            <div key={l} style={{ background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:9, padding:"11px 15px" }}>
+              <div style={{ fontSize:9, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:3 }}>{l}</div>
+              <div style={{ fontSize:12.5, fontWeight:600, color:C.textMid }}>{v}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Tabs */}
+        <div style={{ borderBottom:`1px solid ${C.border}`, marginBottom:26, display:"flex", gap:2 }}>
+          {["overview","monthly","sources","transactions"].map(t=>(
+            <button key={t} className={`ttab ${tab===t?"on":""}`} onClick={()=>setTab(t)}>{t.charAt(0).toUpperCase()+t.slice(1)}</button>
+          ))}
+        </div>
+
+        {/* OVERVIEW */}
+        {tab==="overview" && m && <>
+          <div style={{ marginBottom:28 }}>
+            <SHead title="Core Financial Metrics"/>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))", gap:13 }}>
+              <MetricCard label="A — Avg. End-of-Day Balance" value={`UGX ${fmt(m.A)}`} sub={`Over ${m.days} calendar days`} color={C.green}
+                interp="Average daily liquidity. Non-transaction days are forward-filled from the last known balance."/>
+              <MetricCard label="VLI — Viable Loan Installment" value={`UGX ${fmt(m.VLI)}`} sub="20% × Avg. Monthly Credits" color={C.primary}
+                interp="Maximum recommended monthly loan repayment based on gross inflows."/>
+              <MetricCard label="CV — Credit Volatility" value={fmtPct(m.CV)} sub={`σ = UGX ${fmt(m.stdC)}  ·  μ = UGX ${fmt(m.meanC)}`} color={cvI.color} bdg={cvI}
+                interp={m.CV<20?"Highly consistent monthly revenue — strong lending signal.":m.CV<50?"Moderate variation. Assess seasonal factors.":"High month-to-month swings. Income may be irregular."}/>
+              <MetricCard label="CCR — Cash Concentration Ratio" value={fmtPct(m.CCR)} sub="Top 3 eligible sources ÷ Total credits" color={ccrI.color} bdg={ccrI}
+                interp={m.CCR<10?"Extremely dispersed — very low dependency on any single source.":m.CCR<30?"Well-diversified income. Low concentration risk.":m.CCR<60?"Moderate concentration. Monitor key sources.":"Heavily concentrated. Higher dependency risk."}/>
+            </div>
+          </div>
+
+          <SHead title="Period Summary"/>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:11, marginBottom:26 }}>
+            {[["Total Credits",totalC,C.green,`${txns.filter(t=>t.credit).length} inflows`],
+              ["Total Debits", totalD,C.red,  `${txns.filter(t=>t.debit ).length} outflows`],
+              ["Net Flow",totalC-totalD,totalC>=totalD?C.green:C.red,totalC>=totalD?"Net positive":"Net negative"]
+            ].map(([l,v,c,s])=>(
+              <div key={l} style={{ background:C.bgCard, border:`1px solid ${c}24`, borderRadius:11, padding:"16px 20px" }}>
+                <div style={{ fontSize:9, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:7 }}>{l}</div>
+                <div style={{ fontSize:22, fontWeight:800, color:c }}>{v<0?"-":""}UGX {fmt(Math.abs(v))}</div>
+                <div style={{ fontSize:10.5, color:C.textDim, marginTop:3 }}>{s}</div>
+              </div>
+            ))}
+          </div>
+
+          {related.length>0 && (
+            <div style={{ background:C.bgCard, border:`1px solid ${C.amber}24`, borderRadius:11, padding:"16px 20px" }}>
+              <div style={{ fontSize:11, color:C.amber, fontWeight:700, marginBottom:9 }}>⚠ Related Parties Excluded from CCR</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:7 }}>
+                {related.map(p=><span key={p} style={{ background:C.amber+"12", border:`1px solid ${C.amber}2e`, color:"#fbbf24", padding:"3px 11px", borderRadius:20, fontSize:11.5 }}>{p}</span>)}
+              </div>
+            </div>
+          )}
+        </>}
+
+        {/* MONTHLY */}
+        {tab==="monthly" && m && <>
+          <SHead title="Monthly Breakdown"/>
+          <div style={{ background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:11, overflow:"hidden", marginBottom:18 }}>
+            <DTable headers={["Month","Credits (UGX)","Debits (UGX)","Net (UGX)"]}
+              rows={m.mLabels.map((mo,i)=>{ const net=m.mC[i]-m.mD[i]; return [mo,`UGX ${fmt(m.mC[i])}`,`UGX ${fmt(m.mD[i])}`,`${net>=0?"+":""}UGX ${fmt(Math.abs(net))}`]; })}
+              rowBg={row=>row[3].startsWith("+")?"#091a0d":row[3].startsWith("-")?"#1a0909":undefined}/>
+          </div>
+
+          <SHead title="Monthly Credits vs Debits"/>
+          <div style={{ background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:11, padding:"18px 22px", marginBottom:18 }}>
+            {m.mLabels.map((mo,i)=>{ const mx=Math.max(...m.mC,...m.mD)||1; return (
+              <div key={mo} style={{ marginBottom:14 }}>
+                <div style={{ fontSize:11, color:C.textDim, marginBottom:5, fontFamily:"'DM Mono',monospace" }}>{mo}</div>
+                <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:4 }}>
+                  <span style={{ width:20, fontSize:9, color:C.green, fontFamily:"'DM Mono',monospace" }}>CR</span>
+                  <Bar pct={(m.mC[i]/mx)*100} color={C.green}/>
+                  <span style={{ width:95, fontSize:9.5, color:C.green, fontFamily:"'DM Mono',monospace" }}>UGX {fmt(m.mC[i])}</span>
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:9 }}>
+                  <span style={{ width:20, fontSize:9, color:C.red, fontFamily:"'DM Mono',monospace" }}>DR</span>
+                  <Bar pct={(m.mD[i]/mx)*100} color={C.red}/>
+                  <span style={{ width:95, fontSize:9.5, color:C.red, fontFamily:"'DM Mono',monospace" }}>UGX {fmt(m.mD[i])}</span>
+                </div>
+              </div>
+            );})}
+          </div>
+
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:11 }}>
+            {[["Mean Monthly Credits",`UGX ${fmt(m.meanC)}`,C.primaryLight],["Std Deviation (σ)",`UGX ${fmt(m.stdC)}`,C.purple],["Coeff. of Variation",fmtPct(m.CV),cvI.color]].map(([l,v,c])=>(
+              <div key={l} style={{ background:C.bgCard, border:`1px solid ${c}24`, borderRadius:10, padding:"13px 17px", textAlign:"center" }}>
+                <div style={{ fontSize:9, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1, textTransform:"uppercase", marginBottom:5 }}>{l}</div>
+                <div style={{ fontSize:19, fontWeight:800, color:c }}>{v}</div>
+              </div>
+            ))}
+          </div>
+        </>}
+
+        {/* SOURCES */}
+        {tab==="sources" && m && <>
+          <SHead title="Credit Sources — CCR Analysis"/>
+          <div style={{ background:C.bgCard, border:`2px solid ${ccrI.color}38`, borderRadius:11, padding:"18px 22px", marginBottom:18, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div>
+              <div style={{ fontSize:9.5, color:C.textDim, fontFamily:"'DM Mono',monospace", letterSpacing:1.5, textTransform:"uppercase", marginBottom:5 }}>CCR Result</div>
+              <div style={{ fontSize:11.5, color:C.textDim }}>Top 3 eligible: <span style={{ color:C.textMid }}>{m.top3.map(([s])=>s).join(", ")||"—"}</span></div>
+              <div style={{ fontSize:11.5, color:C.textDim }}>UGX {fmt(m.top3Total)} ÷ UGX {fmt(m.totalCredits)}</div>
+            </div>
+            <div style={{ textAlign:"right" }}>
+              <div style={{ fontSize:38, fontWeight:800, color:ccrI.color, lineHeight:1 }}>{fmtPct(m.CCR)}</div>
+              <div style={{ fontSize:10, color:ccrI.color, fontFamily:"'DM Mono',monospace", letterSpacing:1, marginTop:3 }}>{ccrI.label}</div>
+            </div>
+          </div>
+          <div style={{ background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:11, overflow:"hidden" }}>
+            <DTable headers={["Source","Total (UGX)","% of Total","CCR Status"]}
+              rows={Object.entries(m.srcMap).sort((a,b)=>b[1]-a[1]).map(([src,v])=>{
+                const isCh  = CHANNEL_SOURCES.has(src);
+                const isRel = related.some(r=>src.toLowerCase().includes(r.toLowerCase()));
+                const isT3  = m.top3.some(([s])=>s===src);
+                return [src,`UGX ${fmt(v)}`,fmtPct(v/m.totalCredits*100),isCh?"⊘ Channel":isRel?"⊘ Related Party":isT3?"✓ Top 3":"Eligible"];
+              })}
+              rowBg={row=>row[3]==="✓ Top 3"?"#0a1e10":row[3].startsWith("⊘")?"#1a0a0a":undefined}/>
+          </div>
+        </>}
+
+        {/* TRANSACTIONS */}
+        {tab==="transactions" && <>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+            <SHead title={`All Transactions (${txns.length})`}/>
+            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search narration or date…"
+              style={{ background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:8, padding:"7px 13px", color:C.text, fontSize:12, width:230, fontFamily:"'Sora',sans-serif" }}/>
+          </div>
+          <div style={{ background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:11, overflow:"hidden", maxHeight:550, overflowY:"auto" }}>
+            <DTable headers={["Date","Narration","Debit (UGX)","Credit (UGX)","Balance (UGX)"]}
+              rows={filtered.map(t=>[t.date||"—",(t.particulars||"—").length>56?(t.particulars.slice(0,56)+"…"):t.particulars||"—",t.debit?fmt(t.debit):"—",t.credit?fmt(t.credit):"—",t.balance!=null?fmt(t.balance):"—"])}
+              rowBg={row=>row[2]!=="—"?"#180a0a":row[3]!=="—"?"#0a1810":undefined}/>
+          </div>
+          <div style={{ fontSize:11, color:C.textFaint, marginTop:8, textAlign:"right", fontFamily:"'DM Mono',monospace" }}>{filtered.length} of {txns.length} shown</div>
+        </>}
+
+      </div>
+    </div>
+  );
+}
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
